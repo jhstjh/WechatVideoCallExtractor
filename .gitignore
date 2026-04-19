@@ -1,0 +1,30 @@
+# Output / generated files
+*.db
+*.html
+*.png
+*.jpg
+*.jpeg
+!avatars/*.jpg
+!avatars/*.jpeg
+!avatars/*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Leftover from abandoned icon-detection feature
+icons/
