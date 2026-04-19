@@ -34,7 +34,7 @@ CALL_KEYWORDS = [
 ]
 
 CHAT_AREA_LEFT_RATIO = 0.30
-SCROLL_DOWN_CLICKS = 50
+SCROLL_DOWN_CLICKS = 60
 
 DB_FILE = "wechat_calls.db"
 
@@ -223,36 +223,29 @@ def main():
     seen_hashes = set()
     seen_entries = set()
     pending_calls = []
-    total = 0
+    total = [0]   # boxed in a list so the inner closure can update it
 
-    print("\n-- scanning (bottom -> top) --\n")
-
-    for page in range(args.max_pages):
-        # ── capture frame ──
+    def process_frame(label):
+        """OCR + extract from one captured frame.
+        Returns one of: 'ok', 'duplicate', 'no_ocr', 'out_of_month'."""
+        nonlocal pending_calls
         img = capture_window(hwnd)
         img_np = np.array(img)
         fhash = hashlib.md5(img_np.tobytes()).hexdigest()
-
         if fhash in seen_hashes:
-            print("\nReached top of chat (duplicate frame). Done!")
-            break
+            return "duplicate"
         seen_hashes.add(fhash)
 
-        # ── OCR ──
         results, _ = ocr(img_np)
         if results is None:
-            pyautogui.press("pageup")
-            pyautogui.moveTo(cx, cy)
-            pyautogui.scroll(-SCROLL_DOWN_CLICKS)
-            continue
+            return "no_ocr"
 
-        # filter out sidebar text (left portion of window)
         frame_w = img.width
         min_x = frame_w * CHAT_AREA_LEFT_RATIO
         results = [r for r in results if _x_min(r[0]) >= min_x]
 
         if args.debug:
-            print(f"--- page {page} : {len(results)} OCR lines ---")
+            print(f"--- {label} : {len(results)} OCR lines ---")
             for bbox, text, conf in sorted(results, key=lambda r: _cy(r[0])):
                 tag = ""
                 if is_call_entry(text):
@@ -262,7 +255,6 @@ def main():
                 print(f"  y={_cy(bbox):6.0f}  x={_x_min(bbox):6.0f}  "
                       f"conf={conf}  \"{text.strip()}\"{tag}")
 
-        # ── month boundary check ──
         if args.month:
             ts_lines = [txt for _, txt, _ in results if looks_like_timestamp(txt)]
             out_of_month = [t for t in ts_lines
@@ -270,10 +262,8 @@ def main():
             if out_of_month and not any(
                 extract_month(t) == args.month for t in ts_lines
             ):
-                print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
-                break
+                return "out_of_month"
 
-        # ── resolve pending calls: bottom-most timestamp is the one ──
         if pending_calls:
             all_ts = sorted(
                 [(bbox, txt) for bbox, txt, _ in results if looks_like_timestamp(txt)],
@@ -282,22 +272,23 @@ def main():
             )
             if all_ts:
                 ts_text = all_ts[0][1]
+                ok = True
                 if args.month:
                     ts_month = extract_month(ts_text)
                     if ts_month is not None and ts_month != args.month:
                         pending_calls = []
-                        continue
-                for caller, status, dur_str, dur_s in pending_calls:
-                    key = (ts_text.strip(), caller, status, dur_str or "")
-                    if key not in seen_entries:
-                        seen_entries.add(key)
-                        if store(conn, ts_text.strip(), caller, status, dur_str, dur_s):
-                            total += 1
-                            d = dur_str or "--"
-                            print(f"[FOUND] {ts_text.strip()} | {caller:>4} | {status} | {d}")
-                pending_calls = []
+                        ok = False
+                if ok:
+                    for caller, status, dur_str, dur_s in pending_calls:
+                        key = (ts_text.strip(), caller, status, dur_str or "")
+                        if key not in seen_entries:
+                            seen_entries.add(key)
+                            if store(conn, ts_text.strip(), caller, status, dur_str, dur_s):
+                                total[0] += 1
+                                d = dur_str or "--"
+                                print(f"[FOUND] {ts_text.strip()} | {caller:>4} | {status} | {d}")
+                    pending_calls = []
 
-        # ── process entries bottom -> top ──
         for bbox, text, conf in sorted(results, key=lambda r: _cy(r[0]),
                                        reverse=True):
             if not is_call_entry(text):
@@ -332,20 +323,44 @@ def main():
             seen_entries.add(key)
 
             if store(conn, ts_text.strip(), caller, status, dur_str, dur_s):
-                total += 1
+                total[0] += 1
                 d = dur_str or "--"
                 print(f"[FOUND] {ts_text.strip()} | {caller:>4} | {status} | {d}")
             else:
                 d = dur_str or "--"
                 print(f"[SKIP]  {ts_text.strip()} | {caller:>4} | {status} | {d}  (already in DB)")
 
-        # ── scroll up one page, then nudge down to clear any clipped entry ──
-        pyautogui.press("pageup")
-        pyautogui.moveTo(cx, cy)
-        pyautogui.scroll(-SCROLL_DOWN_CLICKS)
+        return "ok"
 
+    print("\n-- scanning (bottom -> top) --\n")
+
+    # Initial frame (whatever the user has on screen)
+    r = process_frame("initial")
+    if r == "out_of_month":
+        print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
     else:
-        print(f"\nStopped after {args.max_pages} pages (use --max-pages to increase)")
+        for page in range(args.max_pages):
+            # 1. Page up, OCR the new view
+            pyautogui.press("pageup")
+            r1 = process_frame(f"page {page} post-pageup")
+            if r1 == "duplicate":
+                print("\nReached top of chat (duplicate frame). Done!")
+                break
+            if r1 == "out_of_month":
+                print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
+                break
+
+            # 2. Scroll down to reveal anything clipped at the bottom, OCR again
+            pyautogui.moveTo(cx, cy)
+            pyautogui.scroll(-SCROLL_DOWN_CLICKS)
+            r2 = process_frame(f"page {page} post-scroll")
+            if r2 == "out_of_month":
+                print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
+                break
+        else:
+            print(f"\nStopped after {args.max_pages} pages (use --max-pages to increase)")
+
+    total = total[0]
 
     conn.close()
     print(f"\nTotal records: {total}")

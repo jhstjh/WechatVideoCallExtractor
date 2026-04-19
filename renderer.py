@@ -38,9 +38,15 @@ def avatar_html(data_uri, name, side):
 
 
 def fmt_timestamp(ts: str) -> str:
-    """Insert spaces: '3月15日星期天00:47' -> '3月15日 星期天 00:47'"""
+    """Insert spaces between date / day-of-week / time.
+       '3月15日星期天00:47'  -> '3月15日 星期天 00:47'
+       '3月15日00:47'        -> '3月15日 00:47'
+       '昨天00:47' / '今天00:47' -> '昨天 00:47' / '今天 00:47'
+    """
     ts = re.sub(r'(日)(星期)', r'\1 \2', ts)
     ts = re.sub(r'(星期[一二三四五六天日]|周[一二三四五六日天])(\d)', r'\1 \2', ts)
+    ts = re.sub(r'(\d+月\d+日)(\d)', r'\1 \2', ts)
+    ts = re.sub(r'(昨天|今天|前天)(\d)', r'\1 \2', ts)
     return ts
 
 
