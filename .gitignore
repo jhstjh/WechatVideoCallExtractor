@@ -1,5 +1,6 @@
 # Output / generated files
 *.db
+*.db.bak*
 *.html
 *.png
 *.jpg

@@ -3,3 +3,10 @@ Pillow
 numpy
 pyautogui
 rapidocr-onnxruntime
+windows-capture        # default capture backend; pass --no-wgc to disable
+
+# Optional, opt-in via flags:
+#   --gpu  → CUDA inference for RapidOCR. Replace the cpu-only
+#            onnxruntime that comes with rapidocr-onnxruntime
+#            with onnxruntime-gpu. Requires a working CUDA install.
+# onnxruntime-gpu

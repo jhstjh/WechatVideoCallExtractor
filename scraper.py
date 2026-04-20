@@ -83,8 +83,14 @@ def is_call_entry(text: str) -> bool:
     return any(kw in s for kw in CALL_KEYWORDS)
 
 
-_TS_RE = re.compile(r"\d{1,2}:\d{2}")
+_TS_RE = re.compile(r"([01]?\d|2[0-3]):[0-5]\d")
 _MONTH_RE = re.compile(r"(\d{1,2})月")
+_DATE_PREFIX_RE = re.compile(
+    r"(\d{1,2}月\d{1,2}日"          # 3月15日
+    r"|今天|昨天|前天"               # relative dates
+    r"|星期[一二三四五六天日]"        # 星期X
+    r"|周[一二三四五六日天])"         # 周X
+)
 
 
 def extract_month(text: str):
@@ -94,10 +100,14 @@ def extract_month(text: str):
 
 
 def looks_like_timestamp(text: str) -> bool:
+    """A real WeChat session-timestamp must have BOTH a date marker
+    (e.g. '3月15日', '今天', '星期五') and an HH:MM time within 00:00-23:59."""
     s = text.strip()
     if is_call_entry(s):
         return False
     if len(s) > 40:
+        return False
+    if not _DATE_PREFIX_RE.search(s):
         return False
     return bool(_TS_RE.search(s))
 
@@ -225,20 +235,74 @@ def main():
     pending_calls = []
     total = [0]   # boxed in a list so the inner closure can update it
 
+    def ts_sort_key(ts_text):
+        """Parse 'X月Y日[星期Z]HH:MM' into a tuple for chronological compare."""
+        m = re.search(
+            r"(\d{1,2})月(\d{1,2})日"
+            r"(?:星期[一二三四五六天日]|周[一二三四五六日天])?"
+            r"(\d{1,2}):(\d{2})",
+            ts_text,
+        )
+        if m:
+            return (int(m.group(1)), int(m.group(2)),
+                    int(m.group(3)), int(m.group(4)))
+        return (0, 0, 0, 0)
+
+    def resolve_pending(candidates):
+        """Resolve pending calls using a list of candidate timestamps from the
+        current PageUp+scroll cycle's two frames. For each pending entry, only
+        candidates that are chronologically OLDER than the entry's recorded
+        ceiling are considered; among those, the chronologically latest is
+        chosen. Entries that have no valid candidate this cycle remain pending."""
+        nonlocal pending_calls
+        if not pending_calls or not candidates:
+            return
+        # Dedupe candidates while preserving the strings
+        cand_unique = list({c.strip() for c in candidates if c})
+        remaining = []
+        for caller, status, dur_str, dur_s, ceiling in pending_calls:
+            if ceiling is None:
+                valid = cand_unique
+            else:
+                ceil_key = ts_sort_key(ceiling)
+                valid = [c for c in cand_unique if ts_sort_key(c) < ceil_key]
+            if not valid:
+                remaining.append((caller, status, dur_str, dur_s, ceiling))
+                if args.debug:
+                    print(f"  >> pending ({caller},{status},{dur_str}) ceiling={ceiling!r}: "
+                          f"no candidate older than ceiling — keeping for next cycle")
+                continue
+            chosen = max(valid, key=ts_sort_key)
+            if args.month:
+                tsm = extract_month(chosen)
+                if tsm is not None and tsm != args.month:
+                    continue
+            key = (chosen, caller, status, dur_str or "")
+            if key in seen_entries:
+                continue
+            seen_entries.add(key)
+            if store(conn, chosen, caller, status, dur_str, dur_s):
+                total[0] += 1
+                d = dur_str or "--"
+                print(f"[FOUND] {chosen} | {caller:>4} | {status} | {d}  "
+                      f"(resolved pending; ceiling was {ceiling!r})")
+        pending_calls = remaining
+
     def process_frame(label):
         """OCR + extract from one captured frame.
-        Returns one of: 'ok', 'duplicate', 'no_ocr', 'out_of_month'."""
+        Returns (status, ts_strings_in_frame) where status is one of
+        'ok', 'duplicate', 'no_ocr', 'out_of_month'."""
         nonlocal pending_calls
         img = capture_window(hwnd)
         img_np = np.array(img)
         fhash = hashlib.md5(img_np.tobytes()).hexdigest()
         if fhash in seen_hashes:
-            return "duplicate"
+            return "duplicate", []
         seen_hashes.add(fhash)
 
         results, _ = ocr(img_np)
         if results is None:
-            return "no_ocr"
+            return "no_ocr", []
 
         frame_w = img.width
         min_x = frame_w * CHAT_AREA_LEFT_RATIO
@@ -255,39 +319,28 @@ def main():
                 print(f"  y={_cy(bbox):6.0f}  x={_x_min(bbox):6.0f}  "
                       f"conf={conf}  \"{text.strip()}\"{tag}")
 
+        ts_strings_in_frame = [txt.strip() for _, txt, _ in results
+                               if looks_like_timestamp(txt)]
+
         if args.month:
-            ts_lines = [txt for _, txt, _ in results if looks_like_timestamp(txt)]
-            out_of_month = [t for t in ts_lines
+            out_of_month = [t for t in ts_strings_in_frame
                             if extract_month(t) is not None and extract_month(t) != args.month]
             if out_of_month and not any(
-                extract_month(t) == args.month for t in ts_lines
+                extract_month(t) == args.month for t in ts_strings_in_frame
             ):
-                return "out_of_month"
+                return "out_of_month", ts_strings_in_frame
 
-        if pending_calls:
-            all_ts = sorted(
-                [(bbox, txt) for bbox, txt, _ in results if looks_like_timestamp(txt)],
-                key=lambda x: _cy(x[0]),
-                reverse=True,
-            )
-            if all_ts:
-                ts_text = all_ts[0][1]
-                ok = True
-                if args.month:
-                    ts_month = extract_month(ts_text)
-                    if ts_month is not None and ts_month != args.month:
-                        pending_calls = []
-                        ok = False
-                if ok:
-                    for caller, status, dur_str, dur_s in pending_calls:
-                        key = (ts_text.strip(), caller, status, dur_str or "")
-                        if key not in seen_entries:
-                            seen_entries.add(key)
-                            if store(conn, ts_text.strip(), caller, status, dur_str, dur_s):
-                                total[0] += 1
-                                d = dur_str or "--"
-                                print(f"[FOUND] {ts_text.strip()} | {caller:>4} | {status} | {d}")
-                    pending_calls = []
+        # Ceiling for any call queued from THIS frame: the chronologically
+        # OLDEST visible TS. Since find_timestamp_above will return None for
+        # such calls, every visible TS in the frame is BELOW the call (i.e.
+        # newer); the oldest is the strictest upper bound on the call's true
+        # session timestamp.
+        frame_ceiling = (min(ts_strings_in_frame, key=ts_sort_key)
+                         if ts_strings_in_frame else None)
+
+        # NOTE: pending-call resolution is deferred — the main loop combines
+        # the bottom_ts of the post-pageup and post-scroll frames and resolves
+        # pending using the chronologically later one.
 
         for bbox, text, conf in sorted(results, key=lambda r: _cy(r[0]),
                                        reverse=True):
@@ -301,10 +354,11 @@ def main():
                 status = extract_status(text)
                 dur_str, dur_s = parse_duration(text)
                 key_partial = (caller, status, dur_str or "")
-                if key_partial not in [(c, s, d or "") for c, s, d, _ in pending_calls]:
-                    pending_calls.append((caller, status, dur_str, dur_s))
+                if key_partial not in [(c, s, d or "") for c, s, d, _, _ in pending_calls]:
+                    pending_calls.append((caller, status, dur_str, dur_s, frame_ceiling))
                     if args.debug:
-                        print(f"  >> CALL at y={_cy(bbox):.0f}: \"{text.strip()}\" — no timestamp, queued as pending")
+                        print(f"  >> CALL at y={_cy(bbox):.0f}: \"{text.strip()}\" — no timestamp, "
+                              f"queued as pending (ceiling={frame_ceiling!r})")
                 continue
 
             if args.month:
@@ -330,32 +384,52 @@ def main():
                 d = dur_str or "--"
                 print(f"[SKIP]  {ts_text.strip()} | {caller:>4} | {status} | {d}  (already in DB)")
 
-        return "ok"
+        return "ok", ts_strings_in_frame
 
     print("\n-- scanning (bottom -> top) --\n")
 
-    # Initial frame (whatever the user has on screen)
-    r = process_frame("initial")
+    # Initial frame (whatever the user has on screen). Pending calls created
+    # here will be resolved in the first PageUp+scroll cycle below.
+    r, _ = process_frame("initial")
     if r == "out_of_month":
         print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
     else:
+        stop = False
         for page in range(args.max_pages):
-            # 1. Page up, OCR the new view
+            # 1. Page up, OCR the new view → collect TSes (set A)
             pyautogui.press("pageup")
-            r1 = process_frame(f"page {page} post-pageup")
+            r1, ts_list_a = process_frame(f"page {page} post-pageup")
             if r1 == "duplicate":
                 print("\nReached top of chat (duplicate frame). Done!")
                 break
             if r1 == "out_of_month":
                 print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
-                break
+                stop = True
 
-            # 2. Scroll down to reveal anything clipped at the bottom, OCR again
-            pyautogui.moveTo(cx, cy)
-            pyautogui.scroll(-SCROLL_DOWN_CLICKS)
-            r2 = process_frame(f"page {page} post-scroll")
-            if r2 == "out_of_month":
-                print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
+            # 2. Scroll down 60, OCR again → collect TSes (set B). Catches
+            #    timestamps that may have been clipped at the bottom of the
+            #    post-pageup view.
+            ts_list_b = []
+            if not stop:
+                pyautogui.moveTo(cx, cy)
+                pyautogui.scroll(-SCROLL_DOWN_CLICKS)
+                r2, ts_list_b = process_frame(f"page {page} post-scroll")
+                if r2 == "out_of_month":
+                    print(f"\nAll timestamps in this frame are outside month {args.month}. Done!")
+                    stop = True
+
+            # 3. Resolve pending using the union of TSes from both frames.
+            #    For each pending entry, only TSes chronologically older than
+            #    its recorded ceiling are considered; among those the latest
+            #    is chosen.
+            candidates = list(ts_list_a) + list(ts_list_b)
+            if pending_calls and candidates:
+                if args.debug:
+                    print(f"  >> trying to resolve {len(pending_calls)} pending call(s); "
+                          f"candidates={sorted(set(candidates), key=ts_sort_key)}")
+                resolve_pending(candidates)
+
+            if stop:
                 break
         else:
             print(f"\nStopped after {args.max_pages} pages (use --max-pages to increase)")

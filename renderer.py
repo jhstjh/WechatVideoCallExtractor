@@ -50,6 +50,40 @@ def fmt_timestamp(ts: str) -> str:
     return ts
 
 
+_DATE_RE = re.compile(r"(\d{1,2})月(\d{1,2})日")
+_TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+
+
+def ts_sort_key(ts: str):
+    """Parse a WeChat session-timestamp string into a tuple suitable for
+    chronological sorting (ascending = oldest first).
+
+    Handles:
+      "3月15日 22:21"           -> (3, 15, 22, 21)
+      "3月15日星期五 22:21"      -> (3, 15, 22, 21)
+      "今天 22:21" / "昨天" /     -> bucketed via a pseudo-month so they
+        "前天 22:21"              sort AFTER any explicit-date entry in
+                                  the same DB (they refer to the days
+                                  immediately preceding the scrape run).
+    """
+    s = ts or ""
+    tm = _TIME_RE.search(s)
+    hh, mm = (int(tm.group(1)), int(tm.group(2))) if tm else (0, 0)
+
+    md = _DATE_RE.search(s)
+    if md:
+        return (int(md.group(1)), int(md.group(2)), hh, mm)
+
+    if "前天" in s:
+        return (99, 1, hh, mm)
+    if "昨天" in s:
+        return (99, 2, hh, mm)
+    if "今天" in s:
+        return (99, 3, hh, mm)
+
+    return (0, 0, hh, mm)
+
+
 def fmt_dur(seconds):
     if seconds is None:
         return None
@@ -68,7 +102,6 @@ THEM_NAME = "对方"
 def compute_stats(rows):
     total = len(rows)
     connected = [r for r in rows if r["duration_seconds"] and r["duration_seconds"] > 0]
-    missed = total - len(connected)
 
     total_s = sum(r["duration_seconds"] for r in connected)
     avg_s = total_s // len(connected) if connected else 0
@@ -78,23 +111,16 @@ def compute_stats(rows):
     them_rows = [r for r in connected if r["caller"] == "them"]
     me_total_s = sum(r["duration_seconds"] for r in me_rows)
     them_total_s = sum(r["duration_seconds"] for r in them_rows)
-    me_missed = sum(1 for r in rows if r["caller"] == "me"
-                    and (not r["duration_seconds"] or r["duration_seconds"] == 0))
-    them_missed = sum(1 for r in rows if r["caller"] == "them"
-                      and (not r["duration_seconds"] or r["duration_seconds"] == 0))
 
     return {
         "total": total,
         "connected": len(connected),
-        "missed": missed,
         "total_dur": fmt_dur(total_s) or "0:00",
         "avg_dur": fmt_dur(avg_s) or "0:00",
         "longest_dur": fmt_dur(longest) or "0:00",
         "me_calls": len(me_rows),
-        "me_missed": me_missed,
         "me_dur": fmt_dur(me_total_s) or "0:00",
         "them_calls": len(them_rows),
-        "them_missed": them_missed,
         "them_dur": fmt_dur(them_total_s) or "0:00",
     }
 
@@ -104,13 +130,18 @@ def render(db_path, output_path):
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT timestamp, caller, status, duration, duration_seconds "
-        "FROM calls ORDER BY id DESC"
+        "FROM calls"
     ).fetchall()
     conn.close()
 
     if not rows:
         print("No records found in database.")
         return
+
+    # Sort chronologically (oldest first) by parsing the timestamp text;
+    # the `id` column reflects scrape-insertion order which is NOT
+    # chronological for the chat-history scraper.
+    rows = sorted(rows, key=lambda r: ts_sort_key(r["timestamp"]))
 
     stats = compute_stats(rows)
     me_uri = img_to_data_uri(ME_AVATAR)
@@ -437,7 +468,6 @@ body{{
     <h3>总览</h3>
     <div class="stat-row"><span class="stat-label">总通话次数</span><span class="stat-val">{total}</span></div>
     <div class="stat-row"><span class="stat-label">已接通</span><span class="stat-val accent">{connected}</span></div>
-    <div class="stat-row"><span class="stat-label">未接通 / 已取消</span><span class="stat-val">{missed}</span></div>
     <div class="stat-row"><span class="stat-label">总通话时长</span><span class="stat-val accent">{total_dur}</span></div>
     <div class="stat-row"><span class="stat-label">平均通话时长</span><span class="stat-val">{avg_dur}</span></div>
     <div class="stat-row"><span class="stat-label">最长通话</span><span class="stat-val">{longest_dur}</span></div>
@@ -446,14 +476,12 @@ body{{
   <div class="stat-section">
     <h3>{me_name}</h3>
     <div class="stat-row"><span class="stat-label">拨出已接通</span><span class="stat-val">{me_calls}</span></div>
-    <div class="stat-row"><span class="stat-label">拨出未接通</span><span class="stat-val">{me_missed}</span></div>
     <div class="stat-row"><span class="stat-label">拨出总时长</span><span class="stat-val">{me_dur}</span></div>
   </div>
 
   <div class="stat-section">
     <h3>{them_name}</h3>
     <div class="stat-row"><span class="stat-label">拨入已接通</span><span class="stat-val">{them_calls}</span></div>
-    <div class="stat-row"><span class="stat-label">拨入未接通</span><span class="stat-val">{them_missed}</span></div>
     <div class="stat-row"><span class="stat-label">拨入总时长</span><span class="stat-val">{them_dur}</span></div>
   </div>
 </div>
